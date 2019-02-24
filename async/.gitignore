@@ -1,0 +1,25 @@
+# Mac OS X
+.DS_Store
+
+# IntelliJ Idea
+.idea
+*.iml
+*.iws
+*.ipr
+out/
+classes/
+
+# Eclipse (who uses this?)
+.settings
+.project
+
+# The rest...
+*.class
+*.log
+target/
+log/
+
+# GoCD
+cruise-output/
+
+/kube/generated/*
