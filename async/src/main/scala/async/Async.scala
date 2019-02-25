@@ -1,8 +1,7 @@
 package async
 
-import scala.concurrent.Future
 import scala.concurrent.ExecutionContext.Implicits.global
-import scala.util.control.NonFatal
+import scala.concurrent.Future
 
 object Async {
 
@@ -13,7 +12,7 @@ object Async {
     * should return a failed `Future` with the same error.
     */
   def transformSuccess(eventuallyX: Future[Int]): Future[Boolean] = {
-    eventuallyX.map {i =>
+    eventuallyX.map { i =>
       i % 2 == 0
     }
   }
@@ -26,7 +25,7 @@ object Async {
     * should return a successful `Future` with the same value.
     */
   def recoverFailure(eventuallyX: Future[Int]): Future[Int] = {
-    eventuallyX.recover{
+    eventuallyX.recover {
       case t: Throwable => -1
     }
   }
@@ -41,11 +40,11 @@ object Async {
     * second asynchronous computations, paired together.
     */
   def sequenceComputations[A, B](
-    makeAsyncComputation1: () => Future[A],
-    makeAsyncComputation2: () => Future[B]
-  ): Future[(A, B)] = {
-    makeAsyncComputation1().flatMap{ comp1 =>
-      makeAsyncComputation2().map(comp2 => (comp1,comp2))
+                                  makeAsyncComputation1: () => Future[A],
+                                  makeAsyncComputation2: () => Future[B]
+                                ): Future[(A, B)] = {
+    makeAsyncComputation1().flatMap { comp1 =>
+      makeAsyncComputation2().map(comp2 => (comp1, comp2))
     }
   }
 
@@ -56,9 +55,9 @@ object Async {
     * If one of them fails, this method should return the failure.
     */
   def concurrentComputations[A, B](
-    makeAsyncComputation1: () => Future[A],
-    makeAsyncComputation2: () => Future[B]
-  ): Future[(A, B)] = {
+                                    makeAsyncComputation1: () => Future[A],
+                                    makeAsyncComputation2: () => Future[B]
+                                  ): Future[(A, B)] = {
     makeAsyncComputation1().zip(makeAsyncComputation2())
   }
 
@@ -69,14 +68,14 @@ object Async {
     * are eventually performed.
     */
   def insist[A](makeAsyncComputation: () => Future[A], maxAttempts: Int): Future[A] = {
-    makeAsyncComputation().recoverWith{
-      case t: Throwable =>
-        if(maxAttempts == 0) {
-          t
-        } else {
-          insist(makeAsyncComputation, maxAttempts-1)
-        }
-     }
+    if (maxAttempts >1 ) {
+      makeAsyncComputation().recoverWith {
+        case t: Throwable =>
+          insist(makeAsyncComputation, maxAttempts - 1)
+      }
+    } else {
+      makeAsyncComputation()
+    }
   }
 
 }
