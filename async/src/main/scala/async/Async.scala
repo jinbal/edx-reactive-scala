@@ -68,13 +68,12 @@ object Async {
     * are eventually performed.
     */
   def insist[A](makeAsyncComputation: () => Future[A], maxAttempts: Int): Future[A] = {
-    if (maxAttempts >1 ) {
-      makeAsyncComputation().recoverWith {
-        case t: Throwable =>
-          insist(makeAsyncComputation, maxAttempts - 1)
+    makeAsyncComputation().recoverWith { case t: Throwable =>
+      if (maxAttempts > 1) {
+        insist(makeAsyncComputation, maxAttempts - 1)
+      } else {
+        Future.failed(t)
       }
-    } else {
-      makeAsyncComputation()
     }
   }
 
