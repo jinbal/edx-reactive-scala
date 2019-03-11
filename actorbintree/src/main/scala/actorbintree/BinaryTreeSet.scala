@@ -72,19 +72,14 @@ class BinaryTreeSet extends Actor {
   /** Accepts `Operation` and `GC` messages. */
   val normal: Receive = {
     case operation: Operation =>
-      pendingQueue =  pendingQueue.enqueue(operation)
-      runNext
+      root.forward(operation)
     case GC =>
+      //      println(s"GC started for root ${root.toString()} this ${self.toString()}")
       val newRoot = createRoot
-      root ! CopyTo(newRoot)
       context.become(garbageCollecting(newRoot))
+      root ! CopyTo(newRoot)
   }
 
-  def runNext = {
-    val (nextOp, rest) = pendingQueue.dequeue
-    pendingQueue = rest
-    root ! nextOp
-  }
 
   // optional
   /** Handles messages while garbage collection is performed.
@@ -93,9 +88,13 @@ class BinaryTreeSet extends Actor {
     */
   def garbageCollecting(newRoot: ActorRef): Receive = {
     case CopyFinished =>
+      //      println("GC done")
+      pendingQueue.foreach {
+        newRoot ! _
+      }
+      pendingQueue = Queue.empty
       root = newRoot
-      runNext
-      context.become(normal)
+      context.unbecome()
     case operation: Operation =>
       pendingQueue = pendingQueue.enqueue(operation)
   }
@@ -132,7 +131,8 @@ class BinaryTreeNode(val elem: Int, initiallyRemoved: Boolean) extends Actor {
   /** Handles `Operation` messages and `CopyTo` requests. */
   val normal: Receive = {
     case insert: Insert =>
-      if (insert.elem == elem) {
+      if (insert.elem == elem && !initiallyRemoved) {
+        removed = false
         insert.requester ! OperationFinished(insert.id)
       } else {
         val position = getPosition(insert)
@@ -143,19 +143,8 @@ class BinaryTreeNode(val elem: Int, initiallyRemoved: Boolean) extends Actor {
           insert.requester ! OperationFinished(insert.id)
         }
       }
-    case contains: Contains =>
-      if (elem == contains.elem) {
-        contains.requester ! ContainsResult(contains.id, !removed)
-      } else {
-        val position = getPosition(contains)
-        if (!subtrees.contains(position)) {
-          contains.requester ! ContainsResult(contains.id, false)
-        } else {
-          subtrees(position) ! contains
-        }
-      }
     case remove: Remove =>
-      if (remove.elem == elem) {
+      if (remove.elem == elem && !initiallyRemoved) {
         removed = true
         remove.requester ! OperationFinished(remove.id)
       } else {
@@ -166,13 +155,29 @@ class BinaryTreeNode(val elem: Int, initiallyRemoved: Boolean) extends Actor {
           remove.requester ! OperationFinished(remove.id)
         }
       }
-    case copyTo: CopyTo =>
-      if (!removed) {
-        copyTo.treeNode ! Insert(self, 1, elem)
+
+    case contains: Contains =>
+      if (elem == contains.elem && !initiallyRemoved) {
+        contains.requester ! ContainsResult(contains.id, !removed)
+      } else {
+        val position = getPosition(contains)
+        if (!subtrees.contains(position)) {
+          contains.requester ! ContainsResult(contains.id, false)
+        } else {
+          subtrees(position) ! contains
+        }
       }
-      val childActors: Set[ActorRef] = subtrees.map(_._2).toSet
-      childActors.foreach(_ ! copyTo)
-      context.become(copying(childActors, false))
+    case CopyTo(newRoot) =>
+      if (!removed) {
+        newRoot ! Insert(self, -1, elem)
+      }
+      val childActors: Set[ActorRef] = subtrees.values.toSet
+      childActors.foreach { a =>
+        a ! CopyTo(newRoot)
+      }
+      isCopyDone(childActors, removed)
+
+
   }
 
   private def getPosition(operation: Operation) = {
@@ -189,17 +194,16 @@ class BinaryTreeNode(val elem: Int, initiallyRemoved: Boolean) extends Actor {
     * `insertConfirmed` tracks whether the copy of this node to the new tree has been confirmed.
     */
   def copying(expected: Set[ActorRef], insertConfirmed: Boolean): Receive = {
-    case CopyFinished =>
-      val newExpected = expected - sender
-      if (newExpected.isEmpty && insertConfirmed) {
-        context.parent ! CopyFinished
-        context.stop(self)
-      } else {
-        context.become(copying(newExpected, insertConfirmed))
-      }
-    case OperationFinished =>
-      context.become(copying(expected, true))
+    case OperationFinished(-1) => isCopyDone(expected, true)
+    case CopyFinished => isCopyDone(expected - sender, insertConfirmed)
   }
 
+  def isCopyDone(expected: Set[ActorRef], insertConfirmed: Boolean): Unit = {
+    if (expected.isEmpty && insertConfirmed) self ! PoisonPill
+    else context.become(copying(expected, insertConfirmed))
+  }
+
+  override def postStop() = context.parent ! CopyFinished
 
 }
+
