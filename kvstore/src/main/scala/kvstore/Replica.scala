@@ -1,8 +1,12 @@
 package kvstore
 
-import akka.actor.{Actor, ActorRef, Props}
+import akka.actor.SupervisorStrategy.{Restart, Resume}
+import akka.actor.{Actor, ActorRef, OneForOneStrategy, Props, ReceiveTimeout}
 import kvstore.Arbiter._
+import kvstore.Persistence.{Persist, Persisted, PersistenceException}
 import kvstore.Replicator.{Snapshot, SnapshotAck}
+
+import scala.concurrent.duration._
 
 object Replica {
 
@@ -36,6 +40,11 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
   /*
    * The contents of this actor is just a suggestion, you can implement it in any way you like.
    */
+  override val supervisorStrategy =
+    OneForOneStrategy(maxNrOfRetries = 10, withinTimeRange = 1 second) {
+      case _: PersistenceException => Resume
+    }
+  val persistence = context.actorOf(persistenceProps)
 
   var kv = Map.empty[String, String]
   // a map from secondary replicas to replicators
@@ -64,20 +73,42 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
     case _ =>
   }
 
+  def persistingLeader: Receive = {
+    case Persisted(key, id) =>
+      sender() ! OperationAck(id)
+      context.unbecome()
+    case Get(key, id) =>
+      sender() ! GetResult(key, kv.get(key), id)
+  }
+
+  def persistingReplica(send:ActorRef, persist: Persist): Receive = {
+    case Persisted(key, seq) =>
+      send ! SnapshotAck(key, seq)
+      context.become(replica)
+    case Get(key, id) =>
+      sender() ! GetResult(key, kv.get(key), id)
+    case ReceiveTimeout =>
+      context.setReceiveTimeout(100 milliseconds)
+      persistence ! persist
+  }
+
   /* TODO Behavior for the replica role. */
   val replica: Receive = {
     case Get(key, id) =>
       sender() ! GetResult(key, kv.get(key), id)
     case Snapshot(key, valueOption, seq) =>
       if (seq <= _seqCounter) {
-        if (seq == _seqCounter ) {
+        if (seq == _seqCounter) {
           valueOption match {
             case Some(v) => kv += (key -> v)
             case None => kv -= (key)
           }
-          _seqCounter = seq+1
+          _seqCounter = seq + 1
         }
-        sender() ! SnapshotAck(key, seq)
+        val persist = Persist(key, valueOption, seq)
+        context.setReceiveTimeout(100 milliseconds)
+        persistence ! persist
+        context.become(persistingReplica(sender(),persist))
       }
     case _ =>
   }
