@@ -2,6 +2,7 @@ package kvstore
 
 import akka.actor.{Actor, ActorRef, Props}
 import kvstore.Arbiter._
+import kvstore.Replicator.{Snapshot, SnapshotAck}
 
 object Replica {
 
@@ -41,6 +42,7 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
   var secondaries = Map.empty[ActorRef, ActorRef]
   // the current set of replicators
   var replicators = Set.empty[ActorRef]
+  var _seqCounter = 0L
 
   arbiter ! Join
 
@@ -64,6 +66,19 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
 
   /* TODO Behavior for the replica role. */
   val replica: Receive = {
+    case Get(key, id) =>
+      sender() ! GetResult(key, kv.get(key), id)
+    case Snapshot(key, valueOption, seq) =>
+      if (seq <= _seqCounter) {
+        if (seq == _seqCounter ) {
+          valueOption match {
+            case Some(v) => kv += (key -> v)
+            case None => kv -= (key)
+          }
+          _seqCounter = seq+1
+        }
+        sender() ! SnapshotAck(key, seq)
+      }
     case _ =>
   }
 }
