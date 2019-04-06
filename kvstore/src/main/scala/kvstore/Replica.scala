@@ -94,15 +94,13 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
       context.become(leader)
   }
 
-  def persistingReplica(send: ActorRef, persist: Persist): Receive = {
+  def persistingReplica(send: ActorRef, persist: Persist, cancellable: Cancellable): Receive = {
     case Persisted(key, seq) =>
+      cancellable.cancel()
       send ! SnapshotAck(key, seq)
       context.become(replica)
     case Get(key, id) =>
       sender() ! GetResult(key, kv.get(key), id)
-    case ReceiveTimeout =>
-      context.setReceiveTimeout(100 milliseconds)
-      persistence ! persist
   }
 
   /* TODO Behavior for the replica role. */
@@ -119,9 +117,8 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
           _seqCounter = seq + 1
         }
         val persist = Persist(key, valueOption, seq)
-        context.setReceiveTimeout(100 milliseconds)
-        persistence ! persist
-        context.become(persistingReplica(sender(), persist))
+        val cancellable: Cancellable = context.system.scheduler.schedule(0 milliseconds, 100 milliseconds, persistence, persist)
+        context.become(persistingReplica(sender(), persist, cancellable))
       }
     case _ =>
   }
