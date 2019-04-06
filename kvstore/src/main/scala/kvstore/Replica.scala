@@ -1,7 +1,7 @@
 package kvstore
 
 import akka.actor.SupervisorStrategy.{Restart, Resume}
-import akka.actor.{Actor, ActorRef, OneForOneStrategy, Props, ReceiveTimeout}
+import akka.actor.{Actor, ActorRef, Cancellable, OneForOneStrategy, Props, ReceiveTimeout, Terminated}
 import kvstore.Arbiter._
 import kvstore.Persistence.{Persist, Persisted, PersistenceException}
 import kvstore.Replicator.{Snapshot, SnapshotAck}
@@ -36,12 +36,12 @@ object Replica {
 class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
 
   import Replica._
-
+  import context.dispatcher
   /*
    * The contents of this actor is just a suggestion, you can implement it in any way you like.
    */
   override val supervisorStrategy =
-    OneForOneStrategy(maxNrOfRetries = 10, withinTimeRange = 1 second) {
+    OneForOneStrategy(maxNrOfRetries = 100, withinTimeRange = 1 second) {
       case _: PersistenceException => Resume
     }
   val persistence = context.actorOf(persistenceProps)
@@ -66,22 +66,35 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
       sender() ! GetResult(key, kv.get(key), id)
     case Insert(key, value, id) =>
       kv += (key -> value)
-      sender() ! OperationAck(id)
+      val persist = Persist(key, Some(value), id)
+      context.setReceiveTimeout(1000 milliseconds)
+      val cancellable: Cancellable = context.system.scheduler.schedule(0 milliseconds, 100 milliseconds, persistence, persist)
+      context.become(persistingLeader(sender(), persist,cancellable))
     case Remove(key, id) =>
       kv -= (key)
-      sender() ! OperationAck(id)
+      val persist = Persist(key, None, id)
+      context.setReceiveTimeout(1000 milliseconds)
+      val cancellable: Cancellable = context.system.scheduler.schedule(0 milliseconds, 100 milliseconds, persistence, persist)
+      context.become(persistingLeader(sender(), persist, cancellable))
     case _ =>
   }
 
-  def persistingLeader: Receive = {
-    case Persisted(key, id) =>
-      sender() ! OperationAck(id)
-      context.unbecome()
+  def persistingLeader(send: ActorRef, persist: Persist, cancellable: Cancellable): Receive = {
+    case Persisted(_, id) =>
+      cancellable.cancel()
+      send ! OperationAck(id)
+      context.unwatch(persistence)
+      context.become(leader)
     case Get(key, id) =>
       sender() ! GetResult(key, kv.get(key), id)
+    case ReceiveTimeout =>
+      cancellable.cancel()
+      send ! OperationFailed(persist.id)
+      context.unwatch(persistence)
+      context.become(leader)
   }
 
-  def persistingReplica(send:ActorRef, persist: Persist): Receive = {
+  def persistingReplica(send: ActorRef, persist: Persist): Receive = {
     case Persisted(key, seq) =>
       send ! SnapshotAck(key, seq)
       context.become(replica)
@@ -108,7 +121,7 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
         val persist = Persist(key, valueOption, seq)
         context.setReceiveTimeout(100 milliseconds)
         persistence ! persist
-        context.become(persistingReplica(sender(),persist))
+        context.become(persistingReplica(sender(), persist))
       }
     case _ =>
   }
