@@ -4,7 +4,6 @@ import akka.actor.SupervisorStrategy.{Restart, Resume}
 import akka.actor.{Actor, ActorRef, Cancellable, OneForOneStrategy, Props, ReceiveTimeout, Terminated}
 import kvstore.Arbiter._
 import kvstore.Persistence.{Persist, Persisted, PersistenceException}
-import kvstore.Replica.ReplicationComplete
 import kvstore.Replicator.{Replicate, Replicated, Snapshot, SnapshotAck}
 
 import scala.concurrent.duration._
@@ -53,8 +52,7 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
   // the current set of replicators
   var replicators = Set.empty[ActorRef]
   var _seqCounter = 0L
-  // map(id -> (replica, replicatingactor))
-  var pendingReplicaInit: Map[Long, (ActorRef, ActorRef)] = Map.empty
+
 
   def nextSeq() = {
     val ret = _seqCounter
