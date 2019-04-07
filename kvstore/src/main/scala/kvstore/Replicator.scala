@@ -1,6 +1,7 @@
 package kvstore
 
-import akka.actor.{Actor, ActorRef, Props, ReceiveTimeout}
+import akka.actor.{Actor, ActorRef, Cancellable, Props, ReceiveTimeout}
+import kvstore.Replica.OperationFailed
 
 import scala.concurrent.duration._
 import scala.language.postfixOps
@@ -20,13 +21,12 @@ object Replicator {
 class Replicator(val replica: ActorRef) extends Actor {
 
   import Replicator._
+  import context.dispatcher
 
   /*
    * The contents of this actor is just a suggestion, you can implement it in any way you like.
    */
 
-  // map from sequence number to pair of sender and request
-  var acks: Map[Long, (ActorRef, Replicate)] = Map.empty
   // a sequence of not-yet-sent snapshots (you can disregard this if not implementing batching)
   var pending = Vector.empty[Snapshot]
 
@@ -42,28 +42,24 @@ class Replicator(val replica: ActorRef) extends Actor {
   /* TODO Behavior for the Replicator. */
   def receive: Receive = {
     case Replicate(key, valOpt, id) =>
-      val s = sender()
+      val replyTo = sender()
       val seq = nextSeq()
-      val tuple = (s, Replicate(key, valOpt, id))
-      acks += (seq -> tuple)
-      context.setReceiveTimeout(100 milliseconds)
-      replica ! Snapshot(key, valOpt, seq)
-      context.become(replicating)
+      context.setReceiveTimeout(1000 milliseconds)
+      val cancellable: Cancellable = context.system.scheduler.schedule(0 milliseconds, 100 milliseconds, replica, Snapshot(key, valOpt, seq))
+      context.become(replicating(replyTo, cancellable,seq,key))
     case _ =>
   }
 
-  def replicating: Receive = {
+  def replicating(replyTo: ActorRef ,cancellable: Cancellable,id: Long, key:String): Receive = {
     case SnapshotAck(key, seq) =>
-      val (actor, replicate) = acks(seq)
-      context.setReceiveTimeout(Duration.Undefined)
-      acks -= seq
-      actor ! Replicated(replicate.key, replicate.id)
+      replyTo ! Replicated(key, seq)
       context.unbecome()
     case ReceiveTimeout =>
-      context.setReceiveTimeout(100 milliseconds)
-      acks.foreach { case (seq, (_, replicate)) =>
-        replica ! Snapshot(replicate.key, replicate.valueOption, seq)
-      }
+      replyTo ! OperationFailed(id)
+      context.unbecome()
+//    case OperationFailed(failedId) =>
+//      replyTo ! OperationFailed(failedId)
+//      context.unbecome()
     case _ =>
   }
 
