@@ -10,7 +10,7 @@ trait Step3_ReplicatorSpec
   extends FunSuiteLike
         with Matchers { this: KVStoreSuite =>
 
-  test("Step3-case1: Replicator should send snapshots when asked to replicate") {
+  test("Step3-case1: Replicator should replyTo snapshots when asked to replicate") {
     val probe = TestProbe()
     val secondary = TestProbe()
     val replicator = system.actorOf(Replicator.props(secondary.ref), "step3-case1-replicator")

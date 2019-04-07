@@ -45,7 +45,7 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
       case _: PersistenceException => Resume
     }
   val persistence = context.actorOf(persistenceProps)
-
+  context.watch(persistence)
   var kv = Map.empty[String, String]
   // a map from secondary replicas to replicators
   var secondaries = Map.empty[ActorRef, ActorRef]
@@ -83,7 +83,8 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
       context.setReceiveTimeout(1000 milliseconds)
       val cancellable: Cancellable = context.system.scheduler.schedule(0 milliseconds, 100 milliseconds, persistence, persist)
       context.become(persistingLeader(sender(), persist, cancellable))
-    case Replicas(replicas) =>
+    case Replicas(replicasIncPrimary) =>
+      val replicas = replicasIncPrimary - self
       val (remaining, removed) = secondaries.partition(r => replicas.contains(r._1))
       val newReps = replicas.filter(r => !remaining.contains(r)).map { rep =>
         (rep, context.actorOf(Replicator.props(rep)))
@@ -100,54 +101,58 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
     removed.foreach(context.stop)
   }
 
-  def persistingLeader(send: ActorRef, persist: Persist, cancellable: Cancellable): Receive = {
+  def persistingLeader(replyTo: ActorRef, persist: Persist, cancellable: Cancellable): Receive = {
     case Persisted(_, id) =>
       cancellable.cancel()
-      send ! OperationAck(id)
-      context.unwatch(persistence)
-      context.become(leader)
+      synchReplicas(replyTo, persist)
     case Get(key, id) =>
       sender() ! GetResult(key, kv.get(key), id)
     case ReceiveTimeout =>
       cancellable.cancel()
-      send ! OperationFailed(persist.id)
-      context.unwatch(persistence)
+      replyTo ! OperationFailed(persist.id)
       context.become(leader)
   }
 
-  def synchReplicas(primaryReplica: ActorRef, persist: Persist): Unit = {
-    val replicationMessages: Map[Long, Cancellable] = replicators.map { r =>
-      val id = nextSeq()
-      val message = Replicate(persist.key, persist.valueOption, id)
-      val cancellable: Cancellable = context.system.scheduler.schedule(0 milliseconds, 100 milliseconds, r, message)
-      (id, cancellable)
-    }.toMap
+  def synchReplicas(replyTo: ActorRef, persist: Persist): Unit = {
+    if(replicators.isEmpty) {
+      replyTo ! OperationAck(persist.id)
+      context.become(leader)
+    } else {
+      val replicationMessages: Map[Long, Cancellable] = replicators.map { r =>
+        val id = nextSeq()
+        val message = Replicate(persist.key, persist.valueOption, id)
+        val cancellable: Cancellable = context.system.scheduler.schedule(0 milliseconds, 100 milliseconds, r, message)
+        (id, cancellable)
+      }.toMap
 
-    context.become(waitForReplicaSynch(primaryReplica, replicationMessages, persist.id))
+      context.become(waitForReplicaSynch(replyTo, replicationMessages, persist.id))
+    }
   }
 
-  def waitForReplicaSynch(primaryReplica: ActorRef, messages: Map[Long, Cancellable], ackId: Long): Receive = {
+  def waitForReplicaSynch(replyTo: ActorRef, messages: Map[Long, Cancellable], ackId: Long): Receive = {
     case Replicated(_, id) =>
       messages.get(id).map(_.cancel())
-      if (messages.isEmpty) {
-        primaryReplica ! OperationAck(ackId)
+      val pending = messages - id
+      if (pending.isEmpty) {
+        replyTo ! OperationAck(ackId)
         context.become(leader)
       } else {
-        val pending = messages - id
-        context.become(waitForReplicaSynch(primaryReplica, pending, ackId))
+        context.become(waitForReplicaSynch(replyTo, pending, ackId))
       }
     case OperationFailed(id) =>
       messages.get(id).map(_.cancel())
-      primaryReplica ! OperationFailed(ackId)
+      replyTo ! OperationFailed(ackId)
       context.become(leader)
+    case ReceiveTimeout =>
+      replyTo ! OperationFailed(ackId)
     case _ =>
 //      println(s"unexpected")
   }
 
-  def persistingReplica(send: ActorRef, persist: Persist, cancellable: Cancellable): Receive = {
+  def persistingReplica(replyTo: ActorRef, persist: Persist, cancellable: Cancellable): Receive = {
     case Persisted(key, seq) =>
       cancellable.cancel()
-      send ! SnapshotAck(key, seq)
+      replyTo ! SnapshotAck(key, seq)
       context.become(replica)
     case Get(key, id) =>
       sender() ! GetResult(key, kv.get(key), id)
