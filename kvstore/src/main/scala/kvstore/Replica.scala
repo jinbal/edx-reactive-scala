@@ -1,7 +1,7 @@
 package kvstore
 
-import akka.actor.SupervisorStrategy.{Restart, Resume}
-import akka.actor.{Actor, ActorRef, Cancellable, OneForOneStrategy, Props, ReceiveTimeout, Terminated}
+import akka.actor.SupervisorStrategy.Resume
+import akka.actor.{Actor, ActorRef, Cancellable, OneForOneStrategy, Props, ReceiveTimeout}
 import kvstore.Arbiter._
 import kvstore.Persistence.{Persist, Persisted, PersistenceException}
 import kvstore.Replicator.{Replicate, Replicated, Snapshot, SnapshotAck}
@@ -37,6 +37,7 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
 
   import Replica._
   import context.dispatcher
+
   /*
    * The contents of this actor is just a suggestion, you can implement it in any way you like.
    */
@@ -46,6 +47,7 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
     }
   val persistence = context.actorOf(persistenceProps)
   context.watch(persistence)
+
   var kv = Map.empty[String, String]
   // a map from secondary replicas to replicators
   var secondaries = Map.empty[ActorRef, ActorRef]
@@ -53,10 +55,11 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
   var replicators = Set.empty[ActorRef]
   var _seqCounter = 0L
 
+  var replicationIdCounter = 0L
 
-  def nextSeq() = {
-    val ret = _seqCounter
-    _seqCounter += 1
+  def nextRepId() = {
+    val ret = replicationIdCounter
+    replicationIdCounter += 1
     ret
   }
 
@@ -76,7 +79,7 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
       val persist = Persist(key, Some(value), id)
       context.setReceiveTimeout(1000 milliseconds)
       val cancellable: Cancellable = context.system.scheduler.schedule(0 milliseconds, 100 milliseconds, persistence, persist)
-      context.become(persistingLeader(sender(), persist,cancellable))
+      context.become(persistingLeader(sender(), persist, cancellable))
     case Remove(key, id) =>
       kv -= (key)
       val persist = Persist(key, None, id)
@@ -94,8 +97,11 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
       replicators = fullyUpdated.map(_._2).toSet
       val removedReplicas = removed.map(_._2).toSet
       stopRemovedReplicators(removedReplicas)
+      replicateMessages.foreach(r=> synchReplicas(sender(),r))
     case _ =>
   }
+
+  def replicateMessages = kv.map{case (key,value)=> Replicate(key,Option(value), nextRepId())}.toSet
 
   private def stopRemovedReplicators(removed: Set[ActorRef]) = {
     removed.foreach(context.stop)
@@ -104,7 +110,7 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
   def persistingLeader(replyTo: ActorRef, persist: Persist, cancellable: Cancellable): Receive = {
     case Persisted(_, id) =>
       cancellable.cancel()
-      synchReplicas(replyTo, persist)
+      synchReplicas(replyTo, Replicate(persist.key, persist.valueOption, id))
     case Get(key, id) =>
       sender() ! GetResult(key, kv.get(key), id)
     case ReceiveTimeout =>
@@ -113,26 +119,30 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
       context.become(leader)
   }
 
-  def synchReplicas(replyTo: ActorRef, persist: Persist): Unit = {
-    if(replicators.isEmpty) {
-      replyTo ! OperationAck(persist.id)
+  def synchReplicas(replyTo: ActorRef, replicate: Replicate): Unit = {
+    if (replicators.isEmpty) {
+      replyTo ! OperationAck(replicate.id)
       context.become(leader)
     } else {
-      val replicationMessages: Map[Long, Cancellable] = replicators.map { r =>
-        val id = nextSeq()
-        val message = Replicate(persist.key, persist.valueOption, id)
-        val cancellable: Cancellable = context.system.scheduler.schedule(0 milliseconds, 100 milliseconds, r, message)
-        (id, cancellable)
+      val replicationMessages = replicators.map { replicator =>
+        val id = nextRepId()
+        (id,
+          (context.system.scheduler.schedule(0 milliseconds, 100 milliseconds, replicator, replicate),
+            replicator))
       }.toMap
 
-      context.become(waitForReplicaSynch(replyTo, replicationMessages, persist.id))
+      context.become(waitForReplicaSynch(replyTo, replicationMessages, replicate.id))
     }
   }
 
-  def waitForReplicaSynch(replyTo: ActorRef, messages: Map[Long, Cancellable], ackId: Long): Receive = {
+  def waitForReplicaSynch(replyTo: ActorRef, messages: Map[Long, (Cancellable, ActorRef)], ackId: Long): Receive = {
     case Replicated(_, id) =>
-      messages.get(id).map(_.cancel())
-      val pending = messages - id
+      messages.get(id).map(_._1.cancel())
+      //      val pending = messages - id
+      val pending = messages.filter { case (i, (_, replicator)) =>
+        (id != i) || replicators.contains(replicator)
+      }
+      //check for removed replicators and remove from pending
       if (pending.isEmpty) {
         replyTo ! OperationAck(ackId)
         context.become(leader)
@@ -140,13 +150,13 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
         context.become(waitForReplicaSynch(replyTo, pending, ackId))
       }
     case OperationFailed(id) =>
-      messages.get(id).map(_.cancel())
+      messages.foreach { case (_, c) => c._1.cancel() }
       replyTo ! OperationFailed(ackId)
       context.become(leader)
     case ReceiveTimeout =>
       replyTo ! OperationFailed(ackId)
     case _ =>
-//      println(s"unexpected")
+    //      println(s"unexpected")
   }
 
   def persistingReplica(replyTo: ActorRef, persist: Persist, cancellable: Cancellable): Receive = {
