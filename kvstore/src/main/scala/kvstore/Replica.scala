@@ -198,8 +198,7 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
         ref ! Messages(replicate)
         ReplicationActors(replica, ref)
       }.toSet
-      ReplicationManagementInfo(repManagerId, self, replicationActors)
-      pendingReplications += (repManagerId -> ReplicationManagementInfo(repManagerId, self, replicationActors))
+      pendingReplications += (repManagerId -> ReplicationManagementInfo(repManagerId, replyTo, replicationActors))
     }
   }
 
