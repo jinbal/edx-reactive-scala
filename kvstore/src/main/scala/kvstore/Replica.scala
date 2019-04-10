@@ -1,7 +1,7 @@
 package kvstore
 
 import akka.actor.SupervisorStrategy.Resume
-import akka.actor.{Actor, ActorContext, ActorRef, Cancellable, OneForOneStrategy, Props, ReceiveTimeout}
+import akka.actor.{Actor, ActorRef, Cancellable, OneForOneStrategy, Props, ReceiveTimeout}
 import kvstore.Arbiter._
 import kvstore.Persistence.{Persist, Persisted, PersistenceException}
 import kvstore.Replica._
@@ -33,19 +33,23 @@ object Replica {
 
   case class ReplicationActors(replica: ActorRef, replicationManager: ActorRef)
 
-  case class Messages(messages:Set[Replicate])
+  case class Messages(messages: Set[Replicate])
 
   case class ReplicationManagementInfo(id: Long, replyTo: ActorRef, pendingReplications: Set[ReplicationActors]) {
     def removeReplicationManager(replicationManager: ActorRef): ReplicationManagementInfo = {
       copy(pendingReplications = pendingReplications.filterNot(r => r.replicationManager == replicationManager))
     }
 
-    def stopAndRemoveReplicationManager(replicas: Set[ActorRef], context: ActorContext): ReplicationManagementInfo = {
-      pendingReplications.filter(r => replicas.contains(r.replica)).foreach { ra =>
-        context.stop(ra.replicationManager)
-      }
-      val removed = pendingReplications.filterNot(r => replicas.contains(r.replica))
-      copy(pendingReplications = removed)
+    def getRemovedReplicationManagers(replicas: Set[ActorRef]): Set[ReplicationActors] = {
+      pendingReplications.filter(r => replicas.contains(r.replica))
+    }
+
+    def removeReplicationManagers(replicas: Set[ActorRef]): ReplicationManagementInfo = {
+      //      pendingReplications.filter(r => replicas.contains(r.replica)).foreach { ra =>
+      //        context.stop(ra.replicationManager)
+      //      }
+      val remaining = pendingReplications.filterNot(r => replicas.contains(r.replica))
+      copy(pendingReplications = remaining)
     }
 
     def isComplete: Boolean = pendingReplications.isEmpty
@@ -125,19 +129,20 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
       context.become(persistingLeader(sender(), persist, cancellable))
     case Replicas(replicasIncPrimary) =>
       val replicas = replicasIncPrimary - self
-      val removed = secondaryReplicas.diff(replicas)
+      val removedReplicas = secondaryReplicas.diff(replicas)
       val newReplicasWithReplicators = replicas.diff(secondaryReplicas).map { rep =>
         (rep, context.actorOf(Replicator.props(rep)))
       }
-      val remaining = secondaries.filterNot(t => removed.contains(t._1))
+      val remaining = secondaries.filterNot(t => removedReplicas.contains(t._1))
+      stopReplicationManagers(replicas)
+      stopRemovedReplicators(removedReplicas)
       secondaries = remaining ++ newReplicasWithReplicators
       replicators = secondaries.map(_._2).toSet
-      val replicatorsToStop = secondaries.filter(t => removed.contains(t._1)).map(_._2).toSet
-      stopReplicationManagers(replicas)
-      stopRemovedReplicators(replicatorsToStop)
       synchReplicas(nextRepId(), sender(), replicateMessages, newReplicasWithReplicators.toMap)
     case ReplicationManagerFinished(id) =>
       val pending: ReplicationManagementInfo = pendingReplications(id)
+      if (pending.isComplete) pending.replyTo ! OperationAck(pending.id)
+
       val updated = pending.removeReplicationManager(sender())
       if (updated.isComplete) {
         updated.replyTo ! OperationAck(updated.id)
@@ -147,25 +152,37 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
       }
     case ReplicationManagerFailed(ackId) =>
       val pending = pendingReplications(ackId)
-      pending.removeReplicationManager(sender())
-      pending.replyTo ! OperationFailed(ackId)
+      if(pending.isComplete) {
+        pending.replyTo ! OperationAck(ackId)
+      } else {
+        pending.removeReplicationManager(sender())
+        pending.replyTo ! OperationFailed(ackId)
+      }
     case _ =>
   }
 
   def stopReplicationManagers(removedReplicas: Set[ActorRef]) = {
     pendingReplications.foreach { case (id, info) =>
-      info.stopAndRemoveReplicationManager(removedReplicas, context)
+      val repManagers = info.getRemovedReplicationManagers(removedReplicas)
+      info.removeReplicationManagers(removedReplicas)
       if (info.isComplete) {
         info.replyTo ! OperationAck(info.id)
       }
+      repManagers.foreach{repM =>
+        context.stop(repM.replicationManager)
+      }
     }
     pendingReplications = pendingReplications.filterNot(_._2.isComplete)
+
   }
 
   def replicateMessages = kv.map { case (key, value) => Replicate(key, Option(value), nextRepId()) }.toSet
 
   private def stopRemovedReplicators(removed: Set[ActorRef]) = {
-    removed.foreach(context.stop)
+    removed.foreach { r =>
+      val replicator = secondaries(r)
+      context.stop(replicator)
+    }
   }
 
   def persistingLeader(replyTo: ActorRef, persist: Persist, cancellable: Cancellable): Receive = {
