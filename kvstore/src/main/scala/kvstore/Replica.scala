@@ -145,7 +145,10 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
       } else {
         pendingReplications += (id -> updated)
       }
-
+    case ReplicationManagerFailed(ackId) =>
+      val pending = pendingReplications(ackId)
+      pending.removeReplicationManager(sender())
+      pending.replyTo ! OperationFailed(ackId)
     case _ =>
   }
 
@@ -175,15 +178,6 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
       cancellable.cancel()
       replyTo ! OperationFailed(persist.id)
       context.become(leader)
-    case ReplicationManagerFinished(id) =>
-      val pending: ReplicationManagementInfo = pendingReplications(id)
-      val updated = pending.removeReplicationManager(sender())
-      if (updated.isComplete) {
-        updated.replyTo ! OperationAck(updated.id)
-        pendingReplications -= id
-      } else {
-        pendingReplications += (id -> updated)
-      }
   }
 
 
@@ -192,13 +186,13 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
       replyTo ! OperationAck(id)
       context.become(leader)
     } else {
-      val repManagerId = nextRepId()
       val replicationActors = synchReplicators.map { case (replica, replicator) =>
-        val ref = context.actorOf(repManagerProps(repManagerId, self, replicator, replicate))
+        val ref = context.actorOf(repManagerProps(id, self, replicator, replicate))
         ref ! Messages(replicate)
         ReplicationActors(replica, ref)
       }.toSet
-      pendingReplications += (repManagerId -> ReplicationManagementInfo(repManagerId, replyTo, replicationActors))
+      pendingReplications += (id -> ReplicationManagementInfo(id, replyTo, replicationActors))
+      context.become(leader)
     }
   }
 
@@ -245,6 +239,7 @@ class ReplicationManager(ackId: Long, replyTo: ActorRef, replicator: ActorRef, m
         replyTo ! ReplicationManagerFinished(ackId)
         context.stop(self)
       } else {
+        context.setReceiveTimeout(1000 milliseconds)
         messageSchedulers = messages.map { message =>
           (message.id, context.system.scheduler.schedule(0 milliseconds, 100 milliseconds, replicator, message))
         }.toMap
