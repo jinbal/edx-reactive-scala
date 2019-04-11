@@ -134,7 +134,7 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
         (rep, context.actorOf(Replicator.props(rep)))
       }
       val remaining = secondaries.filterNot(t => removedReplicas.contains(t._1))
-      stopReplicationManagers(replicas)
+      stopReplicationManagers(removedReplicas)
       stopRemovedReplicators(removedReplicas)
       secondaries = remaining ++ newReplicasWithReplicators
       replicators = secondaries.map(_._2).toSet
@@ -161,16 +161,19 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
     case _ =>
   }
 
+
   def stopReplicationManagers(removedReplicas: Set[ActorRef]) = {
-    pendingReplications.foreach { case (id, info) =>
+    val copyOfPending  = pendingReplications
+    copyOfPending.foreach { case (id, info) =>
       val repManagers = info.getRemovedReplicationManagers(removedReplicas)
-      info.removeReplicationManagers(removedReplicas)
-      if (info.isComplete) {
-        info.replyTo ! OperationAck(info.id)
+      val newInfo = info.removeReplicationManagers(removedReplicas)
+      if (newInfo.isComplete) {
+        newInfo.replyTo ! OperationAck(info.id)
       }
       repManagers.foreach{repM =>
         context.stop(repM.replicationManager)
       }
+      pendingReplications += (id -> newInfo)
     }
     pendingReplications = pendingReplications.filterNot(_._2.isComplete)
 
@@ -187,11 +190,13 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
 
   def persistingLeader(replyTo: ActorRef, persist: Persist, cancellable: Cancellable): Receive = {
     case Persisted(_, id) =>
+      context.setReceiveTimeout(Duration.Undefined)
       cancellable.cancel()
       synchReplicas(id, replyTo, Set(Replicate(persist.key, persist.valueOption, id)), secondaries)
     case Get(key, id) =>
       sender() ! GetResult(key, kv.get(key), id)
     case ReceiveTimeout =>
+      context.setReceiveTimeout(Duration.Undefined)
       cancellable.cancel()
       replyTo ! OperationFailed(persist.id)
       context.become(leader)
